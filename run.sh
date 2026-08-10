@@ -12,9 +12,17 @@ ADB=(adb ${ANDROID_SERIAL:+-s "$ANDROID_SERIAL"})
 [ -e "$SINK" ] || { echo "no $SINK — modprobe v4l2loopback first" >&2; exit 1; }
 
 "${ADB[@]}" forward "tcp:$PORT" "localabstract:$SOCKET" >/dev/null
+# WIDTH/HEIGHT/FPS/BITRATE env vars ride the start intent as extras; the service clamps
+# them to what the camera supports, and absent extras keep its defaults (1280x720@30).
+EXTRAS=()
+[ "${WIDTH:-}" ] && EXTRAS+=(--ei width "$WIDTH")
+[ "${HEIGHT:-}" ] && EXTRAS+=(--ei height "$HEIGHT")
+[ "${FPS:-}" ] && EXTRAS+=(--ei fps "$FPS")
+[ "${BITRATE:-}" ] && EXTRAS+=(--ei bitrate "$BITRATE")
 # Never `am start` an activity here: waking a locked phone starts face unlock, which
 # opens a camera of its own and pushes the device past the open-camera limit.
-"${ADB[@]}" shell am start-foreground-service -n "$PKG/.CamService" >/dev/null
+"${ADB[@]}" shell am start-foreground-service -n "$PKG/.CamService" \
+    ${EXTRAS[@]+"${EXTRAS[@]}"} >/dev/null
 
 # The service binds its socket a beat after the process starts; wait for it rather than
 # racing ffmpeg against it. /proc/net/unix lists abstract sockets with a leading @.
@@ -29,9 +37,9 @@ done
 }
 
 # Annex-B carries no timestamps, so ffmpeg guesses a 1200k tbr and then drops ~98% of
-# the frames converting down to it. `-r 30` on the input plus passthrough keeps them all.
+# the frames converting down to it. `-r` on the input plus passthrough keeps them all.
 FFMPEG=(ffmpeg -hide_banner -loglevel warning
-    -fflags nobuffer -flags low_delay -r 30
+    -fflags nobuffer -flags low_delay -r "${FPS:-30}"
     -f h264 -i "tcp://127.0.0.1:$PORT" -fps_mode passthrough)
 
 if [ "${1:-}" != "--check" ]; then

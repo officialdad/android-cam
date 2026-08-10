@@ -27,7 +27,8 @@ sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Cam"
 ./run.sh --check         # streams 3s, reads one frame back out of the sink, exits
 ```
 
-`PORT`, `SINK` and `ANDROID_SERIAL` are honoured as environment variables.
+`PORT`, `SINK` and `ANDROID_SERIAL` are honoured as environment variables, and
+`WIDTH`, `HEIGHT`, `FPS` and `BITRATE` select the stream quality (see below).
 
 Needs `adb`, `ffmpeg`, a v4l2loopback sink, a JDK, and an Android SDK with build-tools
 and a platform (`ANDROID_HOME`, else `~/Android/Sdk`). No Gradle: the app is one class
@@ -53,11 +54,21 @@ collide with, nothing listening on a network interface.
 **One client at a time.** The camera is opened when a client connects and released when it
 disconnects, then the service loops back to `accept()`.
 
+**Config rides the start intent, not the socket.** The host picks size/fps/bitrate with
+intent extras — `am start-foreground-service -n …/.CamService --ei width 1920 --ei height
+1080 --ei fps 30 --ei bitrate 8000000` — and the service clamps them to what the camera
+reports (nearest supported size, nearest AE fps range) before starting the encoder. The
+socket stays pure H.264 because its client is ffmpeg reading the stream raw: ffmpeg can
+neither send a config frame nor tolerate a reply frame ahead of the Annex-B. Missing
+extras fall back to 1280x720@30 at 8 Mbps, so an old host keeps working; re-running `am`
+against a live service re-configures it at the next connect.
+
 `min-sdk 21`, `target-sdk 32` — under 33 to avoid the `POST_NOTIFICATIONS` runtime prompt,
 under 34 to avoid foreground-service-type enforcement.
 
 ## Deferred
 
-Camera, resolution and fps are hardcoded to the back camera at 1280x720@30; there is no
-control channel. Latency has not been measured against scrcpy's camera path yet. The
-`android-cam-tui` backend that consumes this lives in that repo.
+Camera selection is hardcoded to the back camera. Latency has not been measured against
+scrcpy's camera path yet. The `android-cam-tui` backend that consumes this lives in that
+repo; its bundled `android-cam.apk` needs a rebuild from this commit before its size/fps
+picker takes effect on the phone.

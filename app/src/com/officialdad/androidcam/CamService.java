@@ -11,6 +11,7 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -22,6 +23,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.util.Log;
 import android.util.Range;
+import android.util.Size;
 import android.view.Surface;
 
 import java.io.IOException;
@@ -46,11 +48,18 @@ public class CamService extends Service {
     static final String SOCKET = "android-cam";
     static final String MIME = "video/avc";
 
-    // ponytail: hardcoded for v1. Camera/size/fps selection comes once the stream works.
+    // Defaults when the start intent carries no extras, so an old host still gets a stream.
     static final int WIDTH = 1280;
     static final int HEIGHT = 720;
     static final int FPS = 30;
     static final int BITRATE = 8_000_000;
+
+    // Requested by the host, applied (clamped to what the camera offers) at the next
+    // client connect. Volatile: written on the main thread, read on the net thread.
+    private volatile int reqWidth = WIDTH;
+    private volatile int reqHeight = HEIGHT;
+    private volatile int reqFps = FPS;
+    private volatile int reqBitrate = BITRATE;
 
     private volatile boolean running;
     private LocalServerSocket server;
@@ -68,9 +77,27 @@ public class CamService extends Service {
         new Thread(this::serve, "net").start();
     }
 
+    /**
+     * The host's config channel is the start intent itself:
+     * `am start-foreground-service -n …/.CamService --ei width 1920 --ei height 1080
+     * --ei fps 30 --ei bitrate 8000000`. The socket stays pure H.264 — the host-side
+     * client is ffmpeg reading the stream raw, so it cannot speak a handshake, and a
+     * reply frame would corrupt its input. `am` can be re-run on a live service to
+     * change the config; it takes effect on the next client connect.
+     */
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null) { // null on a START_STICKY restart: keep the current config
+            reqWidth = positiveOr(intent.getIntExtra("width", 0), reqWidth);
+            reqHeight = positiveOr(intent.getIntExtra("height", 0), reqHeight);
+            reqFps = positiveOr(intent.getIntExtra("fps", 0), reqFps);
+            reqBitrate = positiveOr(intent.getIntExtra("bitrate", 0), reqBitrate);
+        }
         return START_STICKY;
+    }
+
+    private static int positiveOr(int v, int fallback) {
+        return v > 0 ? v : fallback;
     }
 
     @Override
@@ -112,11 +139,19 @@ public class CamService extends Service {
     }
 
     private void stream(LocalSocket sock) throws Exception {
-        MediaFormat fmt = MediaFormat.createVideoFormat(MIME, WIDTH, HEIGHT);
+        CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+        String id = backCameraId(mgr);
+        CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+        Size size = nearestSize(chars, reqWidth, reqHeight);
+        int fps = reqFps;
+        int bitrate = reqBitrate;
+        Log.i(TAG, "streaming " + size + "@" + fps + " " + bitrate + "bps");
+
+        MediaFormat fmt = MediaFormat.createVideoFormat(MIME, size.getWidth(), size.getHeight());
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        fmt.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE);
-        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
+        fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
         // 1s keyframes so a host that connects mid-stream syncs fast.
         fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
 
@@ -127,7 +162,7 @@ public class CamService extends Service {
             codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             surface = codec.createInputSurface();
             codec.start();
-            cam = openCamera(surface);
+            cam = openCamera(mgr, id, chars, surface, fps);
             drain(codec, sock.getOutputStream());
         } finally {
             if (cam != null) cam.close(); // also tears down its capture session
@@ -141,9 +176,8 @@ public class CamService extends Service {
     }
 
     /** Blocks until the camera is open and repeating into {@code surface}. */
-    private CameraDevice openCamera(Surface surface) throws Exception {
-        CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
-        String id = backCameraId(mgr);
+    private CameraDevice openCamera(CameraManager mgr, String id, CameraCharacteristics chars,
+            Surface surface, int fps) throws Exception {
         Log.i(TAG, "opening camera " + id);
 
         ArrayBlockingQueue<Object> opened = new ArrayBlockingQueue<>(1);
@@ -186,8 +220,8 @@ public class CamService extends Service {
 
             CaptureRequest.Builder req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
             req.addTarget(surface);
-            Range<Integer> fps = fpsRange(mgr.getCameraCharacteristics(id));
-            if (fps != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
+            Range<Integer> range = fpsRange(chars, fps);
+            if (range != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range);
             session.setRepeatingRequest(req.build(), null, camHandler);
             return cam;
         } catch (Exception e) {
@@ -237,15 +271,35 @@ public class CamService extends Service {
         return ids[0];
     }
 
-    /** Nearest supported AE range to FPS, or null to leave the camera on auto. */
-    private static Range<Integer> fpsRange(CameraCharacteristics chars) {
+    /** Nearest supported AE range to {@code fps}, or null to leave the camera on auto. */
+    private static Range<Integer> fpsRange(CameraCharacteristics chars, int fps) {
         Range<Integer>[] ranges =
                 chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges == null) return null;
         Range<Integer> best = null;
         for (Range<Integer> r : ranges) {
-            if (r.getUpper() != FPS) continue;
-            if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed 30-30
+            if (r.getUpper() != fps) continue;
+            if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed fps-fps
+        }
+        return best;
+    }
+
+    /** The requested size if the camera offers it, else the supported size nearest by area. */
+    private static Size nearestSize(CameraCharacteristics chars, int w, int h) {
+        StreamConfigurationMap map =
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = map == null ? null : map.getOutputSizes(MediaCodec.class);
+        if (sizes == null || sizes.length == 0) return new Size(w, h); // let the camera decide
+        long want = (long) w * h;
+        Size best = sizes[0];
+        long bestDiff = Long.MAX_VALUE;
+        for (Size s : sizes) {
+            // ponytail: nearest by area only; weigh aspect ratio in if a host ever needs it
+            long diff = Math.abs((long) s.getWidth() * s.getHeight() - want);
+            if (diff < bestDiff) {
+                best = s;
+                bestDiff = diff;
+            }
         }
         return best;
     }
