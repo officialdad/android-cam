@@ -69,6 +69,12 @@ public class CamService extends Service {
     private volatile int reqBitrate = BITRATE;
     private volatile int reqZoom = ZOOM;
     private volatile String reqCamera; // camera2 id; null = back camera default
+    private volatile boolean reqTorch;
+
+    // Live-session state, for mid-stream torch toggles and the dump() probe.
+    private volatile CameraCaptureSession activeSession;
+    private volatile CaptureRequest.Builder activeReq;
+    private volatile boolean connected;
 
     private volatile boolean running;
     private LocalServerSocket server;
@@ -104,6 +110,13 @@ public class CamService extends Service {
             reqZoom = positiveOr(intent.getIntExtra("zoom", 0), reqZoom);
             String cam = intent.getStringExtra("camera");
             if (cam != null) reqCamera = cam.isEmpty() ? null : cam; // "" resets to default
+            // Torch is the one setting that applies mid-stream: a reconnect for a fill
+            // light would blank the video. -1 (absent) keeps the current state.
+            int torch = intent.getIntExtra("torch", -1);
+            if (torch >= 0 && (torch != 0) != reqTorch) {
+                reqTorch = torch != 0;
+                camHandler.post(this::applyTorch);
+            }
         }
         return START_STICKY;
     }
@@ -134,11 +147,13 @@ public class CamService extends Service {
             while (running) {
                 LocalSocket sock = server.accept();
                 Log.i(TAG, "client connected");
+                connected = true;
                 try {
                     stream(sock);
                 } catch (Exception e) {
                     Log.w(TAG, "stream ended: " + e);
                 } finally {
+                    connected = false;
                     closeQuietly(sock);
                 }
             }
@@ -178,6 +193,8 @@ public class CamService extends Service {
             cam = openCamera(mgr, id, chars, surface, fps, zoom);
             drain(codec, sock.getOutputStream());
         } finally {
+            activeSession = null;
+            activeReq = null;
             if (cam != null) cam.close(); // also tears down its capture session
             try {
                 codec.stop();
@@ -237,7 +254,10 @@ public class CamService extends Service {
             if (range != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range);
             Rect crop = zoomCrop(chars, zoom);
             if (crop != null) req.set(CaptureRequest.SCALER_CROP_REGION, crop);
+            if (reqTorch) req.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
             session.setRepeatingRequest(req.build(), null, camHandler);
+            activeSession = session;
+            activeReq = req;
             return cam;
         } catch (Exception e) {
             cam.close();
@@ -309,6 +329,21 @@ public class CamService extends Service {
             if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed fps-fps
         }
         return best;
+    }
+
+    /** Re-issues the repeating request with the current torch state; no-op while idle. */
+    private void applyTorch() {
+        CameraCaptureSession session = activeSession;
+        CaptureRequest.Builder req = activeReq;
+        if (session == null || req == null) return;
+        try {
+            req.set(CaptureRequest.FLASH_MODE, reqTorch
+                    ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_OFF);
+            session.setRepeatingRequest(req.build(), null, camHandler);
+            Log.i(TAG, "torch " + (reqTorch ? "on" : "off"));
+        } catch (Exception e) {
+            Log.w(TAG, "torch update failed: " + e); // session torn down mid-post
+        }
     }
 
     /**
@@ -386,7 +421,35 @@ public class CamService extends Service {
                 cam.put("fpsRanges", fpsRanges);
                 cameras.put(cam);
             }
-            writer.println(new JSONObject().put("cameras", cameras).toString());
+
+            // Requested vs what the clamps would apply right now, so the host can read
+            // back the real stream parameters (e.g. ffmpeg's -r) before connecting.
+            JSONObject requested = new JSONObject()
+                    .put("camera", reqCamera == null ? JSONObject.NULL : reqCamera)
+                    .put("width", reqWidth).put("height", reqHeight)
+                    .put("fps", reqFps).put("bitrate", reqBitrate)
+                    .put("zoom", reqZoom).put("torch", reqTorch);
+            String id = pickCamera(mgr, reqCamera);
+            CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+            Size size = nearestSize(chars, reqWidth, reqHeight);
+            Range<Integer> range = fpsRange(chars, reqFps);
+            Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+            int zoom = Math.max(100, Math.round(
+                    Math.min(reqZoom / 100f, maxZoom == null ? 1f : maxZoom) * 100));
+            JSONObject applied = new JSONObject()
+                    .put("camera", id)
+                    .put("width", size.getWidth()).put("height", size.getHeight())
+                    // fpsAuto: no AE range matched, the camera paces itself — fps is
+                    // then the encoder hint, not a promise.
+                    .put("fps", reqFps).put("fpsAuto", range == null)
+                    .put("zoom", zoom).put("torch", reqTorch);
+
+            writer.println(new JSONObject()
+                    .put("cameras", cameras)
+                    .put("requested", requested)
+                    .put("applied", applied)
+                    .put("connected", connected)
+                    .toString());
         } catch (Exception e) {
             writer.println("probe failed: " + e);
         }

@@ -79,6 +79,7 @@ adb): the full config channel is four integer extras on the start intent.
 | `bitrate` | `int` | 8 000 000 | not clamped — passed to the encoder as-is               |
 | `zoom`    | `int` | 100       | percent, 150 = 1.5x digital; clamped to `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`, ≤100 = off |
 | `camera`  | `string` | back camera | any id the device reports (see probe below); unknown id falls back to back, `""` resets |
+| `torch`   | `int` | 0         | `1` on / `0` off; **applies mid-stream** on the live capture session, absent keeps state |
 
 ```bash
 adb shell am start-foreground-service -n com.officialdad.androidcam/.CamService \
@@ -92,15 +93,23 @@ describing every camera — the scrcpy `--list-camera-sizes` equivalent:
 ```bash
 adb shell dumpsys activity service com.officialdad.androidcam/.CamService
 # … {"cameras":[{"id":"0","facing":"back","orientation":90,"maxZoom":4.0,
-#   "sizes":["4000x3000","1920x1080","1280x720"],"fpsRanges":[[15,15],[15,30],[30,30]]}]} …
+#   "sizes":["4000x3000","1920x1080","1280x720"],"fpsRanges":[[15,15],[15,30],[30,30]]}],
+#   "requested":{"camera":null,"width":1280,"height":720,"fps":30,"bitrate":8000000,
+#     "zoom":100,"torch":false},
+#   "applied":{"camera":"0","width":1280,"height":720,"fps":30,"fpsAuto":false,
+#     "zoom":100,"torch":false},
+#   "connected":false} …
 ```
 
 ActivityManager wraps it in headers/indentation: parse the line containing `"cameras"`
 from its first `{` to its last `}`. `sizes` are encoder-capable output sizes, descending
 by area; `orientation` is `SENSOR_ORIENTATION` degrees (pick the host-side `transpose`
-from it); `maxZoom` bounds the zoom UI. Reading characteristics needs no CAMERA grant, so
-the probe works even when streaming would not. An old APK prints no JSON line — hosts fall
-back to assuming 1280x720@30 on the back camera.
+from it); `maxZoom` bounds the zoom UI. `applied` is what the clamps produce for the
+current request — read `applied.fps` back for ffmpeg's `-r` instead of assuming
+(`fpsAuto: true` means no AE range matched and the fps is an encoder hint, not a
+promise). Reading characteristics needs no CAMERA grant, so the probe works even when
+streaming would not. An old APK prints no JSON line — hosts fall back to assuming
+1280x720@30 on the back camera.
 
 Rules the host can rely on:
 
@@ -110,8 +119,10 @@ Rules the host can rely on:
   stream carries no reply, so the host cannot learn the clamped result from it — probe
   first to ask for what exists, or check the `streaming WxH@fps` line in
   `adb logcat -s android-cam`.
-- **Config applies at the next client connect**, not mid-stream. To re-configure, re-run
-  `am` (idempotent on a live service), then reconnect the stream client.
+- **Config applies at the next client connect**, not mid-stream — except `torch`, which
+  re-issues the live repeating request (a reconnect for a fill light would blank the
+  video). To re-configure anything else, re-run `am` (idempotent on a live service), then
+  reconnect the stream client.
 - **Both compat directions hold.** Old host + new APK: no extras, defaults. New host +
   old APK: extras ignored, 1280x720@30 stream anyway — nothing to detect or tolerate.
 - The socket carries H.264 Annex-B only, from the first byte. Nothing else will ever be

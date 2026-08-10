@@ -23,6 +23,7 @@ EXTRAS=()
 [ "${BITRATE:-}" ] && EXTRAS+=(--ei bitrate "$BITRATE")
 [ "${ZOOM:-}" ] && EXTRAS+=(--ei zoom "$ZOOM")
 [ "${CAMERA:-}" ] && EXTRAS+=(--es camera "$CAMERA")
+[ "${TORCH:-}" ] && EXTRAS+=(--ei torch "$TORCH")   # 1|0, toggles mid-stream too
 # Never `am start` an activity here: waking a locked phone starts face unlock, which
 # opens a camera of its own and pushes the device past the open-camera limit.
 "${ADB[@]}" shell am start-foreground-service -n "$PKG/.CamService" \
