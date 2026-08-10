@@ -1,6 +1,7 @@
 package com.officialdad.androidcam;
 
 import android.app.Notification;
+import android.graphics.Rect;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
@@ -53,6 +54,7 @@ public class CamService extends Service {
     static final int HEIGHT = 720;
     static final int FPS = 30;
     static final int BITRATE = 8_000_000;
+    static final int ZOOM = 100; // percent; 100 = no zoom
 
     // Requested by the host, applied (clamped to what the camera offers) at the next
     // client connect. Volatile: written on the main thread, read on the net thread.
@@ -60,6 +62,7 @@ public class CamService extends Service {
     private volatile int reqHeight = HEIGHT;
     private volatile int reqFps = FPS;
     private volatile int reqBitrate = BITRATE;
+    private volatile int reqZoom = ZOOM;
 
     private volatile boolean running;
     private LocalServerSocket server;
@@ -92,6 +95,7 @@ public class CamService extends Service {
             reqHeight = positiveOr(intent.getIntExtra("height", 0), reqHeight);
             reqFps = positiveOr(intent.getIntExtra("fps", 0), reqFps);
             reqBitrate = positiveOr(intent.getIntExtra("bitrate", 0), reqBitrate);
+            reqZoom = positiveOr(intent.getIntExtra("zoom", 0), reqZoom);
         }
         return START_STICKY;
     }
@@ -145,7 +149,8 @@ public class CamService extends Service {
         Size size = nearestSize(chars, reqWidth, reqHeight);
         int fps = reqFps;
         int bitrate = reqBitrate;
-        Log.i(TAG, "streaming " + size + "@" + fps + " " + bitrate + "bps");
+        int zoom = reqZoom;
+        Log.i(TAG, "streaming " + size + "@" + fps + " " + bitrate + "bps zoom " + zoom + "%");
 
         MediaFormat fmt = MediaFormat.createVideoFormat(MIME, size.getWidth(), size.getHeight());
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
@@ -162,7 +167,7 @@ public class CamService extends Service {
             codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             surface = codec.createInputSurface();
             codec.start();
-            cam = openCamera(mgr, id, chars, surface, fps);
+            cam = openCamera(mgr, id, chars, surface, fps, zoom);
             drain(codec, sock.getOutputStream());
         } finally {
             if (cam != null) cam.close(); // also tears down its capture session
@@ -177,7 +182,7 @@ public class CamService extends Service {
 
     /** Blocks until the camera is open and repeating into {@code surface}. */
     private CameraDevice openCamera(CameraManager mgr, String id, CameraCharacteristics chars,
-            Surface surface, int fps) throws Exception {
+            Surface surface, int fps, int zoom) throws Exception {
         Log.i(TAG, "opening camera " + id);
 
         ArrayBlockingQueue<Object> opened = new ArrayBlockingQueue<>(1);
@@ -222,6 +227,8 @@ public class CamService extends Service {
             req.addTarget(surface);
             Range<Integer> range = fpsRange(chars, fps);
             if (range != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range);
+            Rect crop = zoomCrop(chars, zoom);
+            if (crop != null) req.set(CaptureRequest.SCALER_CROP_REGION, crop);
             session.setRepeatingRequest(req.build(), null, camHandler);
             return cam;
         } catch (Exception e) {
@@ -282,6 +289,26 @@ public class CamService extends Service {
             if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed fps-fps
         }
         return best;
+    }
+
+    /**
+     * Digital zoom: centered crop of the active sensor array, {@code zoom} in percent
+     * (150 = 1.5x), clamped to the camera's max digital zoom. Null at 100% or below —
+     * SCALER_CROP_REGION is (0,0)-origin in active-array coordinates. CONTROL_ZOOM_RATIO
+     * would be cleaner but needs API 30; the phones this app exists for are older.
+     */
+    private static Rect zoomCrop(CameraCharacteristics chars, int zoom) {
+        if (zoom <= 100) return null;
+        Rect active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        if (active == null) return null;
+        Float max = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+        float z = Math.min(zoom / 100f, max == null ? 1f : max);
+        if (z <= 1f) return null;
+        int w = Math.round(active.width() / z);
+        int h = Math.round(active.height() / z);
+        int x = (active.width() - w) / 2;
+        int y = (active.height() - h) / 2;
+        return new Rect(x, y, x + w, y + h);
     }
 
     /** The requested size if the camera offers it, else the supported size nearest by area. */

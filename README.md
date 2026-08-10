@@ -28,7 +28,7 @@ sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Cam"
 ```
 
 `PORT`, `SINK` and `ANDROID_SERIAL` are honoured as environment variables, and
-`WIDTH`, `HEIGHT`, `FPS` and `BITRATE` select the stream quality (see below).
+`WIDTH`, `HEIGHT`, `FPS`, `BITRATE` and `ZOOM` select the stream quality (see below).
 
 Needs `adb`, `ffmpeg`, a v4l2loopback sink, a JDK, and an Android SDK with build-tools
 and a platform (`ANDROID_HOME`, else `~/Android/Sdk`). No Gradle: the app is one class
@@ -77,10 +77,11 @@ adb): the full config channel is four integer extras on the start intent.
 | `height`  | `int` | 720       | (from `StreamConfigurationMap.getOutputSizes(MediaCodec.class)`) |
 | `fps`     | `int` | 30        | AE range with matching upper bound, else camera auto    |
 | `bitrate` | `int` | 8 000 000 | not clamped — passed to the encoder as-is               |
+| `zoom`    | `int` | 100       | percent, 150 = 1.5x digital; clamped to `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`, ≤100 = off |
 
 ```bash
 adb shell am start-foreground-service -n com.officialdad.androidcam/.CamService \
-    --ei width 1920 --ei height 1080 --ei fps 30 --ei bitrate 8000000
+    --ei width 1920 --ei height 1080 --ei fps 30 --ei bitrate 8000000 --ei zoom 150
 ```
 
 Rules the host can rely on:

@@ -12,13 +12,15 @@ ADB=(adb ${ANDROID_SERIAL:+-s "$ANDROID_SERIAL"})
 [ -e "$SINK" ] || { echo "no $SINK — modprobe v4l2loopback first" >&2; exit 1; }
 
 "${ADB[@]}" forward "tcp:$PORT" "localabstract:$SOCKET" >/dev/null
-# WIDTH/HEIGHT/FPS/BITRATE env vars ride the start intent as extras; the service clamps
-# them to what the camera supports, and absent extras keep its defaults (1280x720@30).
+# WIDTH/HEIGHT/FPS/BITRATE/ZOOM env vars ride the start intent as extras; the service
+# clamps them to what the camera supports, and absent extras keep its defaults
+# (1280x720@30, no zoom). ZOOM is percent: 150 = 1.5x digital.
 EXTRAS=()
 [ "${WIDTH:-}" ] && EXTRAS+=(--ei width "$WIDTH")
 [ "${HEIGHT:-}" ] && EXTRAS+=(--ei height "$HEIGHT")
 [ "${FPS:-}" ] && EXTRAS+=(--ei fps "$FPS")
 [ "${BITRATE:-}" ] && EXTRAS+=(--ei bitrate "$BITRATE")
+[ "${ZOOM:-}" ] && EXTRAS+=(--ei zoom "$ZOOM")
 # Never `am start` an activity here: waking a locked phone starts face unlock, which
 # opens a camera of its own and pushes the device past the open-camera limit.
 "${ADB[@]}" shell am start-foreground-service -n "$PKG/.CamService" \
