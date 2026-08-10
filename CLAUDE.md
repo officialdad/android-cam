@@ -19,6 +19,8 @@ Pipeline: `Camera2 → MediaCodec H.264 → Annex-B over localabstract:android-c
 ./run.sh                # forward, start service, pipe into $SINK (default /dev/video0)
 ./run.sh --check        # streams 3s, reads one frame back out of the sink — the repo's only test
 adb logcat -s android-cam   # service-side diagnostics, prints the clamped "streaming WxH@fps" line
+adb shell dumpsys activity service com.officialdad.androidcam/.CamService
+                            # camera probe: one JSON line (ids/facing/orientation/zoom/sizes/fps)
 ```
 
 `run.sh` honours `PORT`, `SINK`, `ANDROID_SERIAL`, and the stream config `WIDTH`, `HEIGHT`,
@@ -43,8 +45,10 @@ below are load-bearing; the README's Design notes explain each at length.
 - **The socket carries H.264 Annex-B only, from the first byte.** The host-side client is
   ffmpeg reading the stream raw (`-f h264 -i tcp://…`), so nothing else may ever be written
   to it — no handshake, no reply frames. That is why stream config rides the **start intent**
-  (`--ei width/height/fps/bitrate/zoom` extras) instead of a socket protocol. Contract for
-  hosts: README ▸ "Host integration contract".
+  (`--ei width/height/fps/bitrate/zoom`, `--es camera` extras) and the probe answers via
+  **`Service.dump()`** (`dumpsys activity service`), the only reply channel. Contract for
+  hosts: README ▸ "Host integration contract"; probe JSON shape also pinned in
+  android-cam-tui#5.
 - **Clamp, never fail.** Requested size snaps to the nearest the camera reports
   (`nearestSize`, area-only for now), fps to a matching AE range else auto (`fpsRange`),
   zoom to max digital zoom (`zoomCrop`, centered `SCALER_CROP_REGION` — crop-before-encode
