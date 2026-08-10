@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.officialdad.androidcam">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+    <application android:label="Android Cam">
+        <!-- No activity. The service is started from the host with
+             `am start-foreground-service`, which never wakes or unlocks the phone. -->
+        <service
+            android:name=".CamService"
+            android:exported="true"
+            android:foregroundServiceType="camera" />
+    </application>
+</manifest>

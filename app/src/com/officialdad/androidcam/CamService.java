@@ -1,0 +1,275 @@
+package com.officialdad.androidcam;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Intent;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.util.Log;
+import android.util.Range;
+import android.view.Surface;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Camera2 -> MediaCodec H.264 -> Annex-B over an abstract unix socket.
+ *
+ * There is deliberately no Activity. The host starts this with
+ * `am start-foreground-service`, which never wakes or unlocks the phone — waking a
+ * locked device starts face unlock, which opens a camera of its own and pushes the
+ * device past the system-wide open-camera limit, so our own open gets rejected.
+ * Being a foreground service is also what gets us past the Android 9+ ban on camera
+ * access from the background.
+ */
+public class CamService extends Service {
+    static final String TAG = "android-cam";
+    static final String SOCKET = "android-cam";
+    static final String MIME = "video/avc";
+
+    // ponytail: hardcoded for v1. Camera/size/fps selection comes once the stream works.
+    static final int WIDTH = 1280;
+    static final int HEIGHT = 720;
+    static final int FPS = 30;
+    static final int BITRATE = 8_000_000;
+
+    private volatile boolean running;
+    private LocalServerSocket server;
+    private HandlerThread camThread;
+    private Handler camHandler;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        startForeground(1, notification());
+        camThread = new HandlerThread("cam");
+        camThread.start();
+        camHandler = new Handler(camThread.getLooper());
+        running = true;
+        new Thread(this::serve, "net").start();
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        // accept() only unblocks by closing the socket out from under it.
+        closeQuietly(server);
+        camThread.quitSafely();
+        super.onDestroy();
+    }
+
+    /** One client at a time. The camera is held only while somebody is connected. */
+    private void serve() {
+        try {
+            server = new LocalServerSocket(SOCKET);
+            Log.i(TAG, "listening on localabstract:" + SOCKET);
+            while (running) {
+                LocalSocket sock = server.accept();
+                Log.i(TAG, "client connected");
+                try {
+                    stream(sock);
+                } catch (Exception e) {
+                    Log.w(TAG, "stream ended: " + e);
+                } finally {
+                    closeQuietly(sock);
+                }
+            }
+        } catch (IOException e) {
+            if (running) Log.e(TAG, "socket error", e);
+        } finally {
+            closeQuietly(server);
+            stopSelf();
+        }
+    }
+
+    private void stream(LocalSocket sock) throws Exception {
+        MediaFormat fmt = MediaFormat.createVideoFormat(MIME, WIDTH, HEIGHT);
+        fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+        fmt.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE);
+        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
+        // 1s keyframes so a host that connects mid-stream syncs fast.
+        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+
+        MediaCodec codec = MediaCodec.createEncoderByType(MIME);
+        Surface surface = null;
+        CameraDevice cam = null;
+        try {
+            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            surface = codec.createInputSurface();
+            codec.start();
+            cam = openCamera(surface);
+            drain(codec, sock.getOutputStream());
+        } finally {
+            if (cam != null) cam.close(); // also tears down its capture session
+            try {
+                codec.stop();
+            } catch (Exception ignored) {
+            }
+            codec.release();
+            if (surface != null) surface.release();
+        }
+    }
+
+    /** Blocks until the camera is open and repeating into {@code surface}. */
+    private CameraDevice openCamera(Surface surface) throws Exception {
+        CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+        String id = backCameraId(mgr);
+        Log.i(TAG, "opening camera " + id);
+
+        ArrayBlockingQueue<Object> opened = new ArrayBlockingQueue<>(1);
+        mgr.openCamera(id, new CameraDevice.StateCallback() {
+            @Override
+            public void onOpened(CameraDevice d) {
+                opened.offer(d);
+            }
+
+            @Override
+            public void onDisconnected(CameraDevice d) {
+                d.close();
+                opened.offer(new IOException("camera disconnected"));
+            }
+
+            @Override
+            public void onError(CameraDevice d, int err) {
+                d.close();
+                opened.offer(new IOException("camera error " + err));
+            }
+        }, camHandler);
+        CameraDevice cam = (CameraDevice) await(opened, "camera open");
+
+        try {
+            ArrayBlockingQueue<Object> configured = new ArrayBlockingQueue<>(1);
+            cam.createCaptureSession(Collections.singletonList(surface),
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(CameraCaptureSession s) {
+                            configured.offer(s);
+                        }
+
+                        @Override
+                        public void onConfigureFailed(CameraCaptureSession s) {
+                            configured.offer(new IOException("capture session failed"));
+                        }
+                    }, camHandler);
+            CameraCaptureSession session =
+                    (CameraCaptureSession) await(configured, "capture session");
+
+            CaptureRequest.Builder req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+            req.addTarget(surface);
+            Range<Integer> fps = fpsRange(mgr.getCameraCharacteristics(id));
+            if (fps != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
+            session.setRepeatingRequest(req.build(), null, camHandler);
+            return cam;
+        } catch (Exception e) {
+            cam.close();
+            throw e;
+        }
+    }
+
+    private void drain(MediaCodec codec, OutputStream out) throws IOException {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        byte[] buf = new byte[64 * 1024];
+        while (running) {
+            int idx = codec.dequeueOutputBuffer(info, 500_000);
+            // <0 is TRY_AGAIN_LATER or FORMAT_CHANGED; SPS/PPS also arrive in-band as a
+            // CODEC_CONFIG buffer, so there is nothing to do for the format change.
+            if (idx < 0) continue;
+            try {
+                if (info.size > 0) {
+                    if (buf.length < info.size) buf = new byte[info.size];
+                    ByteBuffer bb = codec.getOutputBuffer(idx);
+                    bb.position(info.offset);
+                    bb.get(buf, 0, info.size);
+                    out.write(buf, 0, info.size); // encoder output is already Annex-B
+                }
+            } finally {
+                codec.releaseOutputBuffer(idx, false);
+            }
+            if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+        }
+        out.flush();
+    }
+
+    private static Object await(ArrayBlockingQueue<Object> q, String what) throws Exception {
+        Object r = q.poll(10, TimeUnit.SECONDS);
+        if (r == null) throw new IOException(what + " timed out");
+        if (r instanceof Exception) throw (Exception) r;
+        return r;
+    }
+
+    private static String backCameraId(CameraManager mgr) throws CameraAccessException, IOException {
+        String[] ids = mgr.getCameraIdList();
+        if (ids.length == 0) throw new IOException("no cameras");
+        for (String id : ids) {
+            Integer facing = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING);
+            if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) return id;
+        }
+        return ids[0];
+    }
+
+    /** Nearest supported AE range to FPS, or null to leave the camera on auto. */
+    private static Range<Integer> fpsRange(CameraCharacteristics chars) {
+        Range<Integer>[] ranges =
+                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges == null) return null;
+        Range<Integer> best = null;
+        for (Range<Integer> r : ranges) {
+            if (r.getUpper() != FPS) continue;
+            if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed 30-30
+        }
+        return best;
+    }
+
+    private Notification notification() {
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager.class).createNotificationChannel(
+                    new NotificationChannel(TAG, "Android Cam", NotificationManager.IMPORTANCE_LOW));
+            b = new Notification.Builder(this, TAG);
+        } else {
+            b = new Notification.Builder(this);
+        }
+        return b.setContentTitle("Android Cam")
+                .setContentText("Streaming camera to host")
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .build();
+    }
+
+    private static void closeQuietly(Object c) {
+        try {
+            if (c instanceof LocalServerSocket) ((LocalServerSocket) c).close();
+            else if (c instanceof LocalSocket) ((LocalSocket) c).close();
+        } catch (IOException ignored) {
+        }
+    }
+}
