@@ -78,19 +78,38 @@ adb): the full config channel is four integer extras on the start intent.
 | `fps`     | `int` | 30        | AE range with matching upper bound, else camera auto    |
 | `bitrate` | `int` | 8 000 000 | not clamped — passed to the encoder as-is               |
 | `zoom`    | `int` | 100       | percent, 150 = 1.5x digital; clamped to `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`, ≤100 = off |
+| `camera`  | `string` | back camera | any id the device reports (see probe below); unknown id falls back to back, `""` resets |
 
 ```bash
 adb shell am start-foreground-service -n com.officialdad.androidcam/.CamService \
-    --ei width 1920 --ei height 1080 --ei fps 30 --ei bitrate 8000000 --ei zoom 150
+    --ei width 1920 --ei height 1080 --ei fps 30 --ei bitrate 8000000 \
+    --ei zoom 150 --es camera 1
 ```
+
+**Probe.** With the service running, Android's dump channel answers with one line of JSON
+describing every camera — the scrcpy `--list-camera-sizes` equivalent:
+
+```bash
+adb shell dumpsys activity service com.officialdad.androidcam/.CamService
+# … {"cameras":[{"id":"0","facing":"back","orientation":90,"maxZoom":4.0,
+#   "sizes":["4000x3000","1920x1080","1280x720"],"fpsRanges":[[15,15],[15,30],[30,30]]}]} …
+```
+
+ActivityManager wraps it in headers/indentation: parse the line containing `"cameras"`
+from its first `{` to its last `}`. `sizes` are encoder-capable output sizes, descending
+by area; `orientation` is `SENSOR_ORIENTATION` degrees (pick the host-side `transpose`
+from it); `maxZoom` bounds the zoom UI. Reading characteristics needs no CAMERA grant, so
+the probe works even when streaming would not. An old APK prints no JSON line — hosts fall
+back to assuming 1280x720@30 on the back camera.
 
 Rules the host can rely on:
 
 - **Clamp, never fail.** An unsupported size lands on the nearest one the camera offers;
-  an unsupported fps leaves the camera on auto AE. Zero/negative/absent extras keep the
-  previous (or default) values. There is no reply channel, so the host cannot learn the
-  clamped result — `adb logcat -s android-cam` prints the `streaming WxH@fps` line if it
-  matters.
+  an unsupported fps leaves the camera on auto AE; an unknown camera id falls back to the
+  back camera. Zero/negative/absent extras keep the previous (or default) values. The
+  stream carries no reply, so the host cannot learn the clamped result from it — probe
+  first to ask for what exists, or check the `streaming WxH@fps` line in
+  `adb logcat -s android-cam`.
 - **Config applies at the next client connect**, not mid-stream. To re-configure, re-run
   `am` (idempotent on a live service), then reconnect the stream client.
 - **Both compat directions hold.** Old host + new APK: no extras, defaults. New host +
@@ -105,6 +124,6 @@ updates with it).
 
 ## Deferred
 
-Camera selection is hardcoded to the back camera. Latency has not been measured against
-scrcpy's camera path yet. The `android-cam-tui` backend that consumes this lives in that
-repo.
+Latency has not been measured against scrcpy's camera path yet. High-speed capture modes
+and codec selection are out of scope for the hardware this targets. The `android-cam-tui`
+backend that consumes this lives in that repo.

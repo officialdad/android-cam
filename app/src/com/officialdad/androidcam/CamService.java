@@ -27,8 +27,13 @@ import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintWriter;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -63,6 +68,7 @@ public class CamService extends Service {
     private volatile int reqFps = FPS;
     private volatile int reqBitrate = BITRATE;
     private volatile int reqZoom = ZOOM;
+    private volatile String reqCamera; // camera2 id; null = back camera default
 
     private volatile boolean running;
     private LocalServerSocket server;
@@ -96,6 +102,8 @@ public class CamService extends Service {
             reqFps = positiveOr(intent.getIntExtra("fps", 0), reqFps);
             reqBitrate = positiveOr(intent.getIntExtra("bitrate", 0), reqBitrate);
             reqZoom = positiveOr(intent.getIntExtra("zoom", 0), reqZoom);
+            String cam = intent.getStringExtra("camera");
+            if (cam != null) reqCamera = cam.isEmpty() ? null : cam; // "" resets to default
         }
         return START_STICKY;
     }
@@ -144,7 +152,7 @@ public class CamService extends Service {
 
     private void stream(LocalSocket sock) throws Exception {
         CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
-        String id = backCameraId(mgr);
+        String id = pickCamera(mgr, reqCamera);
         CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
         Size size = nearestSize(chars, reqWidth, reqHeight);
         int fps = reqFps;
@@ -268,6 +276,18 @@ public class CamService extends Service {
         return r;
     }
 
+    /** The requested id if the device has it, else the back camera (clamp, never fail). */
+    private static String pickCamera(CameraManager mgr, String wanted)
+            throws CameraAccessException, IOException {
+        if (wanted != null) {
+            for (String id : mgr.getCameraIdList()) {
+                if (id.equals(wanted)) return id;
+            }
+            Log.w(TAG, "no camera " + wanted + ", falling back to back camera");
+        }
+        return backCameraId(mgr);
+    }
+
     private static String backCameraId(CameraManager mgr) throws CameraAccessException, IOException {
         String[] ids = mgr.getCameraIdList();
         if (ids.length == 0) throw new IOException("no cameras");
@@ -329,6 +349,67 @@ public class CamService extends Service {
             }
         }
         return best;
+    }
+
+    /**
+     * The probe channel: `adb shell dumpsys activity service <this>/.CamService` prints
+     * one line of JSON — cameras with id/facing/orientation/maxZoom/sizes/fpsRanges — for
+     * the host to build a real picker from. Reading characteristics needs no CAMERA
+     * grant, so this works even when streaming would not. The stream socket stays pure
+     * H.264; this is the only reply channel there is.
+     */
+    @Override
+    protected void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
+        try {
+            CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+            JSONArray cameras = new JSONArray();
+            for (String id : mgr.getCameraIdList()) {
+                CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+                JSONObject cam = new JSONObject();
+                cam.put("id", id);
+                cam.put("facing", facingName(chars.get(CameraCharacteristics.LENS_FACING)));
+                Integer orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                cam.put("orientation", orientation == null ? 0 : orientation);
+                Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+                cam.put("maxZoom", maxZoom == null ? 1.0 : (double) maxZoom);
+                JSONArray sizes = new JSONArray();
+                for (Size s : encoderSizes(chars)) sizes.put(s.getWidth() + "x" + s.getHeight());
+                cam.put("sizes", sizes);
+                JSONArray fpsRanges = new JSONArray();
+                Range<Integer>[] ranges =
+                        chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                if (ranges != null) {
+                    for (Range<Integer> r : ranges) {
+                        fpsRanges.put(new JSONArray().put(r.getLower()).put(r.getUpper()));
+                    }
+                }
+                cam.put("fpsRanges", fpsRanges);
+                cameras.put(cam);
+            }
+            writer.println(new JSONObject().put("cameras", cameras).toString());
+        } catch (Exception e) {
+            writer.println("probe failed: " + e);
+        }
+    }
+
+    private static String facingName(Integer facing) {
+        if (facing == null) return "external";
+        switch (facing) {
+            case CameraCharacteristics.LENS_FACING_FRONT: return "front";
+            case CameraCharacteristics.LENS_FACING_BACK: return "back";
+            default: return "external";
+        }
+    }
+
+    /** Encoder-capable output sizes, descending by area; empty if the map is missing. */
+    private static Size[] encoderSizes(CameraCharacteristics chars) {
+        StreamConfigurationMap map =
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = map == null ? null : map.getOutputSizes(MediaCodec.class);
+        if (sizes == null) return new Size[0];
+        java.util.Arrays.sort(sizes, (a, b) -> Long.compare(
+                (long) b.getWidth() * b.getHeight(), (long) a.getWidth() * a.getHeight()));
+        return sizes;
     }
 
     private Notification notification() {
