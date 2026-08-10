@@ -66,9 +66,44 @@ against a live service re-configures it at the next connect.
 `min-sdk 21`, `target-sdk 32` — under 33 to avoid the `POST_NOTIFICATIONS` runtime prompt,
 under 34 to avoid foreground-service-type enforcement.
 
+## Host integration contract
+
+For anything driving this APK (android-cam-tui's `prepPhone()`, run.sh, or hand-rolled
+adb): the full config channel is four integer extras on the start intent.
+
+| extra     | type  | default   | clamped to                                              |
+|-----------|-------|-----------|---------------------------------------------------------|
+| `width`   | `int` | 1280      | nearest supported size by area, together with `height`  |
+| `height`  | `int` | 720       | (from `StreamConfigurationMap.getOutputSizes(MediaCodec.class)`) |
+| `fps`     | `int` | 30        | AE range with matching upper bound, else camera auto    |
+| `bitrate` | `int` | 8 000 000 | not clamped — passed to the encoder as-is               |
+
+```bash
+adb shell am start-foreground-service -n com.officialdad.androidcam/.CamService \
+    --ei width 1920 --ei height 1080 --ei fps 30 --ei bitrate 8000000
+```
+
+Rules the host can rely on:
+
+- **Clamp, never fail.** An unsupported size lands on the nearest one the camera offers;
+  an unsupported fps leaves the camera on auto AE. Zero/negative/absent extras keep the
+  previous (or default) values. There is no reply channel, so the host cannot learn the
+  clamped result — `adb logcat -s android-cam` prints the `streaming WxH@fps` line if it
+  matters.
+- **Config applies at the next client connect**, not mid-stream. To re-configure, re-run
+  `am` (idempotent on a live service), then reconnect the stream client.
+- **Both compat directions hold.** Old host + new APK: no extras, defaults. New host +
+  old APK: extras ignored, 1280x720@30 stream anyway — nothing to detect or tolerate.
+- The socket carries H.264 Annex-B only, from the first byte. Nothing else will ever be
+  written to it, so pointing ffmpeg straight at it stays correct.
+
+Remaining wiring in android-cam-tui: `prepPhone()` appends the `--ei` extras from its
+config; `COMPANION_CAM` in `companion.ts` grows real size/fps options; the bundled
+`src/android-cam.apk` gets rebuilt from this repo (its sha256 pin in `companion.ts`
+updates with it).
+
 ## Deferred
 
 Camera selection is hardcoded to the back camera. Latency has not been measured against
 scrcpy's camera path yet. The `android-cam-tui` backend that consumes this lives in that
-repo; its bundled `android-cam.apk` needs a rebuild from this commit before its size/fps
-picker takes effect on the phone.
+repo.
