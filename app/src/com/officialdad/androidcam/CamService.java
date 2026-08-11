@@ -68,6 +68,7 @@ public class CamService extends Service {
     private volatile int reqFps = FPS;
     private volatile int reqBitrate = BITRATE;
     private volatile int reqZoom = ZOOM;
+    private volatile float reqFocus = -1f; // diopters, 0 = infinity; negative = autofocus
     private volatile String reqCamera; // camera2 id; null = back camera default
     private volatile boolean reqTorch;
 
@@ -108,6 +109,10 @@ public class CamService extends Service {
             reqFps = positiveOr(intent.getIntExtra("fps", 0), reqFps);
             reqBitrate = positiveOr(intent.getIntExtra("bitrate", 0), reqBitrate);
             reqZoom = positiveOr(intent.getIntExtra("zoom", 0), reqZoom);
+            // Fixed focus kills continuous-AF hunting (moving scenes blur while the lens
+            // re-seeks). Diopters: 0 = infinity, 2.0 = 50cm; negative = back to autofocus.
+            float focus = intent.getFloatExtra("focus", Float.NaN);
+            if (!Float.isNaN(focus)) reqFocus = focus;
             String cam = intent.getStringExtra("camera");
             if (cam != null) reqCamera = cam.isEmpty() ? null : cam; // "" resets to default
             // Torch is the one setting that applies mid-stream: a reconnect for a fill
@@ -254,6 +259,12 @@ public class CamService extends Service {
             if (range != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range);
             Rect crop = zoomCrop(chars, zoom);
             if (crop != null) req.set(CaptureRequest.SCALER_CROP_REGION, crop);
+            Float dist = focusDistance(chars, reqFocus);
+            if (dist != null) {
+                req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+                req.set(CaptureRequest.LENS_FOCUS_DISTANCE, dist);
+                Log.i(TAG, "focus fixed at " + dist + " diopters");
+            }
             if (reqTorch) req.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
             session.setRepeatingRequest(req.build(), null, camHandler);
             activeSession = session;
@@ -347,6 +358,27 @@ public class CamService extends Service {
     }
 
     /**
+     * Fixed focus distance in diopters (0 = infinity, 2.0 = 50cm), clamped to the lens's
+     * closest focus, or null to keep continuous autofocus — when {@code focus} is
+     * negative (the default) or the device can't do manual focus (LEGACY devices only
+     * list AF_MODE_OFF for fixed-focus lenses). Clamp, never fail.
+     */
+    private static Float focusDistance(CameraCharacteristics chars, float focus) {
+        if (focus < 0) return null;
+        int[] modes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+        boolean off = false;
+        if (modes != null) {
+            for (int m : modes) off |= m == CaptureRequest.CONTROL_AF_MODE_OFF;
+        }
+        if (!off) {
+            Log.w(TAG, "manual focus unsupported, keeping autofocus");
+            return null;
+        }
+        Float min = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+        return Math.min(focus, min == null ? 0f : min);
+    }
+
+    /**
      * Digital zoom: centered crop of the active sensor array, {@code zoom} in percent
      * (150 = 1.5x), clamped to the camera's max digital zoom. Null at 100% or below —
      * SCALER_CROP_REGION is (0,0)-origin in active-array coordinates. CONTROL_ZOOM_RATIO
@@ -407,6 +439,9 @@ public class CamService extends Service {
                 cam.put("orientation", orientation == null ? 0 : orientation);
                 Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
                 cam.put("maxZoom", maxZoom == null ? 1.0 : (double) maxZoom);
+                // Upper bound for a host's focus slider, diopters; 0 = fixed-focus lens.
+                Float minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+                cam.put("minFocusDistance", minFocus == null ? 0.0 : (double) minFocus);
                 JSONArray sizes = new JSONArray();
                 for (Size s : encoderSizes(chars)) sizes.put(s.getWidth() + "x" + s.getHeight());
                 cam.put("sizes", sizes);
@@ -428,7 +463,8 @@ public class CamService extends Service {
                     .put("camera", reqCamera == null ? JSONObject.NULL : reqCamera)
                     .put("width", reqWidth).put("height", reqHeight)
                     .put("fps", reqFps).put("bitrate", reqBitrate)
-                    .put("zoom", reqZoom).put("torch", reqTorch);
+                    .put("zoom", reqZoom).put("torch", reqTorch)
+                    .put("focus", reqFocus < 0 ? JSONObject.NULL : (double) reqFocus);
             String id = pickCamera(mgr, reqCamera);
             CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
             Size size = nearestSize(chars, reqWidth, reqHeight);
@@ -436,13 +472,15 @@ public class CamService extends Service {
             Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
             int zoom = Math.max(100, Math.round(
                     Math.min(reqZoom / 100f, maxZoom == null ? 1f : maxZoom) * 100));
+            Float dist = focusDistance(chars, reqFocus);
             JSONObject applied = new JSONObject()
                     .put("camera", id)
                     .put("width", size.getWidth()).put("height", size.getHeight())
                     // fpsAuto: no AE range matched, the camera paces itself — fps is
                     // then the encoder hint, not a promise.
                     .put("fps", reqFps).put("fpsAuto", range == null)
-                    .put("zoom", zoom).put("torch", reqTorch);
+                    .put("zoom", zoom).put("torch", reqTorch)
+                    .put("focus", dist == null ? JSONObject.NULL : (double) dist);
 
             writer.println(new JSONObject()
                     .put("cameras", cameras)

@@ -24,7 +24,7 @@ adb shell dumpsys activity service com.officialdad.androidcam/.CamService
 ```
 
 `run.sh` honours `PORT`, `SINK`, `ANDROID_SERIAL`, and the stream config `WIDTH`, `HEIGHT`,
-`FPS`, `BITRATE`, `ZOOM` as environment variables.
+`FPS`, `BITRATE`, `ZOOM`, `FOCUS` as environment variables.
 
 **Compile check without an Android SDK** (none may be installed on this machine): download a
 standalone `android.jar` (e.g. `https://github.com/Sable/android-platforms/raw/master/android-30/android.jar`)
@@ -45,14 +45,15 @@ below are load-bearing; the README's Design notes explain each at length.
 - **The socket carries H.264 Annex-B only, from the first byte.** The host-side client is
   ffmpeg reading the stream raw (`-f h264 -i tcp://…`), so nothing else may ever be written
   to it — no handshake, no reply frames. That is why stream config rides the **start intent**
-  (`--ei width/height/fps/bitrate/zoom`, `--es camera` extras) and the probe answers via
+  (`--ei width/height/fps/bitrate/zoom`, `--es camera`, `--ef focus` extras) and the probe answers via
   **`Service.dump()`** (`dumpsys activity service`), the only reply channel. Contract for
   hosts: README ▸ "Host integration contract"; probe JSON shape also pinned in
   android-cam-tui#5.
 - **Clamp, never fail.** Requested size snaps to the nearest the camera reports
   (`nearestSize`, area-only for now), fps to a matching AE range else auto (`fpsRange`),
   zoom to max digital zoom (`zoomCrop`, centered `SCALER_CROP_REGION` — crop-before-encode
-  so no bitrate is spent on discarded pixels). Missing/zero extras keep previous or default
+  so no bitrate is spent on discarded pixels), focus to the lens's closest distance
+  (`focusDistance`, diopters, AF_MODE_OFF; negative/absent keeps autofocus). Missing/zero extras keep previous or default
   values (1280x720@30, 8 Mbps, no zoom), which is the whole backward-compat story.
 - **One client at a time; camera held only while connected.** Config changes apply at the
   next client connect, not mid-stream.

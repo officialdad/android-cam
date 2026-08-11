@@ -80,6 +80,7 @@ adb): the full config channel is four integer extras on the start intent.
 | `zoom`    | `int` | 100       | percent, 150 = 1.5x digital; clamped to `SCALER_AVAILABLE_MAX_DIGITAL_ZOOM`, ≤100 = off |
 | `camera`  | `string` | back camera | any id the device reports (see probe below); unknown id falls back to back, `""` resets |
 | `torch`   | `int` | 0         | `1` on / `0` off; **applies mid-stream** on the live capture session, absent keeps state |
+| `focus`   | `float` | autofocus | diopters (`--ef`): 0 = infinity, 2.0 = 50cm, clamped to `LENS_INFO_MINIMUM_FOCUS_DISTANCE`; negative resets to autofocus. Fixed focus stops continuous-AF hunting on moving scenes |
 
 ```bash
 adb shell am start-foreground-service -n com.officialdad.androidcam/.CamService \
@@ -93,18 +94,20 @@ describing every camera — the scrcpy `--list-camera-sizes` equivalent:
 ```bash
 adb shell dumpsys activity service com.officialdad.androidcam/.CamService
 # … {"cameras":[{"id":"0","facing":"back","orientation":90,"maxZoom":4.0,
+#   "minFocusDistance":10.0,
 #   "sizes":["4000x3000","1920x1080","1280x720"],"fpsRanges":[[15,15],[15,30],[30,30]]}],
 #   "requested":{"camera":null,"width":1280,"height":720,"fps":30,"bitrate":8000000,
-#     "zoom":100,"torch":false},
+#     "zoom":100,"torch":false,"focus":null},
 #   "applied":{"camera":"0","width":1280,"height":720,"fps":30,"fpsAuto":false,
-#     "zoom":100,"torch":false},
+#     "zoom":100,"torch":false,"focus":null},
 #   "connected":false} …
 ```
 
 ActivityManager wraps it in headers/indentation: parse the line containing `"cameras"`
 from its first `{` to its last `}`. `sizes` are encoder-capable output sizes, descending
 by area; `orientation` is `SENSOR_ORIENTATION` degrees (pick the host-side `transpose`
-from it); `maxZoom` bounds the zoom UI. `applied` is what the clamps produce for the
+from it); `maxZoom` bounds the zoom UI; `minFocusDistance` bounds a focus slider in
+diopters (0 = fixed-focus lens, no manual focus). `focus` is `null` while autofocus. `applied` is what the clamps produce for the
 current request — read `applied.fps` back for ffmpeg's `-r` instead of assuming
 (`fpsAuto: true` means no AE range matched and the fps is an encoder hint, not a
 promise). Reading characteristics needs no CAMERA grant, so the probe works even when

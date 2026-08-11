@@ -22,6 +22,7 @@ EXTRAS=()
 [ "${FPS:-}" ] && EXTRAS+=(--ei fps "$FPS")
 [ "${BITRATE:-}" ] && EXTRAS+=(--ei bitrate "$BITRATE")
 [ "${ZOOM:-}" ] && EXTRAS+=(--ei zoom "$ZOOM")
+[ "${FOCUS:-}" ] && EXTRAS+=(--ef focus "$FOCUS") # diopters: 0 = infinity, 2 = 50cm; -1 = autofocus
 [ "${CAMERA:-}" ] && EXTRAS+=(--es camera "$CAMERA")
 [ "${TORCH:-}" ] && EXTRAS+=(--ei torch "$TORCH")   # 1|0, toggles mid-stream too
 # Never `am start` an activity here: waking a locked phone starts face unlock, which
